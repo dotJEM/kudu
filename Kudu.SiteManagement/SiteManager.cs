@@ -11,6 +11,7 @@ using Kudu.Client.Deployment;
 using Kudu.Contracts.Settings;
 using Kudu.Contracts.SourceControl;
 using Kudu.Core.Infrastructure;
+using Kudu.SiteManagement.Configuration;
 using Microsoft.Web.Administration;
 using IIS = Microsoft.Web.Administration;
 
@@ -19,25 +20,37 @@ namespace Kudu.SiteManagement
     public class SiteManager : ISiteManager
     {
         private const string HostingStartHtml = "hostingstart.html";
+        private const string HostingStartHtmlContents = @"<html>
+<head>
+<title>This web site has been successfully created</title>
+<style type=""text/css"">
+    BODY { color: #444444; background-color: #E5F2FF; font-family: verdana; margin: 0px; text-align: center; margin-top: 100px; }
+    H1 { font-size: 16pt; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<h1>This web site has been successfully created</h1><br/>
+</body> 
+</html>";
 
         private readonly static Random portNumberGenRnd = new Random((int)DateTime.UtcNow.Ticks);
 
-        private readonly IPathResolver _pathResolver;
-        private readonly bool _traceFailedRequests;
         private readonly string _logPath;
-        private readonly ISettingsResolver _settingsResolver;
+        private readonly bool _traceFailedRequests;
+        private readonly IPathResolver _pathResolver;
+        private readonly IKuduConfiguration _configuration;
 
-        public SiteManager(IPathResolver pathResolver, ISettingsResolver settingsResolver)
-            : this(pathResolver, traceFailedRequests: false, logPath: null, settingsResolver: settingsResolver)
+        public SiteManager(IPathResolver pathResolver, IKuduConfiguration configuration)
+            : this(pathResolver, configuration, false, null)
         {
         }
 
-        public SiteManager(IPathResolver pathResolver, bool traceFailedRequests, string logPath, ISettingsResolver settingsResolver)
+        public SiteManager(IPathResolver pathResolver, IKuduConfiguration configuration, bool traceFailedRequests, string logPath)
         {
             _logPath = logPath;
             _pathResolver = pathResolver;
             _traceFailedRequests = traceFailedRequests;
-            _settingsResolver = settingsResolver;
+            _configuration = configuration;
         }
 
         public IEnumerable<string> GetSites()
@@ -85,7 +98,7 @@ namespace Kudu.SiteManagement
                 return null;
             }
 
-            foreach (IIS.Binding binding in site.Bindings)
+            foreach (Binding binding in site.Bindings)
             {
                 var builder = new UriBuilder
                 {
@@ -102,17 +115,16 @@ namespace Kudu.SiteManagement
 
         public async Task<Site> CreateSiteAsync(string applicationName)
         {
-            using (var iis = GetServerManager())
+            using (ServerManager iis = GetServerManager())
             {
                 try
                 {
                     // Determine the host header values
-                    List<string> siteBindings = GetDefaultBindings(applicationName, _settingsResolver.SitesBaseUrl);
-                    List<string> serviceSiteBindings = GetDefaultBindings(applicationName, _settingsResolver.ServiceSitesBaseUrl);
+                    List<string> siteBindings = BuildDefaultBindings(applicationName, _configuration.ApplicationBase).ToList();
+                    List<string> serviceSiteBindings = BuildDefaultBindings(applicationName, _configuration.ServiceBase).ToList();
 
                     // Create the service site for this site
-                    string serviceSiteName = GetServiceSite(applicationName);
-                    var serviceSite = CreateSiteAsync(iis, applicationName, serviceSiteName, _pathResolver.ServiceSitePath, serviceSiteBindings);
+                    var serviceSite = CreateSiteAsync(iis, applicationName, GetServiceSite(applicationName), _configuration.ServiceSitePath, serviceSiteBindings);
 
                     // Create the main site
                     string siteName = GetLiveSite(applicationName);
@@ -121,18 +133,7 @@ namespace Kudu.SiteManagement
                     string webRoot = Path.Combine(siteRoot, Constants.WebRoot);
 
                     FileSystemHelpers.EnsureDirectory(webRoot);
-                    File.WriteAllText(Path.Combine(webRoot, HostingStartHtml), @"<html> 
-<head>
-<title>This web site has been successfully created</title>
-<style type=""text/css"">
- BODY { color: #444444; background-color: #E5F2FF; font-family: verdana; margin: 0px; text-align: center; margin-top: 100px; }
- H1 { font-size: 16pt; margin-bottom: 4px; }
-</style>
-</head>
-<body>
-<h1>This web site has been successfully created</h1><br/>
-</body> 
-</html>");
+                    File.WriteAllText(Path.Combine(webRoot, HostingStartHtml), HostingStartHtmlContents);
 
                     var site = CreateSiteAsync(iis, applicationName, siteName, webRoot, siteBindings);
 
@@ -182,13 +183,18 @@ namespace Kudu.SiteManagement
             }
         }
 
+        private IEnumerable<string> BuildDefaultBindings(string applicationName, IUrlConfiguration baseUrl)
+        {
+            if(baseUrl != null) yield return CreateBindingInformation(applicationName, baseUrl.Url);
+        }
+
         public async Task DeleteSiteAsync(string applicationName)
         {
             using (var iis = GetServerManager())
             {
                 // Get the app pool for this application
                 string appPoolName = GetAppPool(applicationName);
-                IIS.ApplicationPool kuduPool = iis.ApplicationPools[appPoolName];
+                ApplicationPool kuduPool = iis.ApplicationPools[appPoolName];
 
                 if (kuduPool == null)
                 {
@@ -230,42 +236,41 @@ namespace Kudu.SiteManagement
             }
         }
 
+        private static string NormalizeBinding(string binding)
+        {
+            //Note: Seems like http and https is the two IIS allows when adding bindings to a site, nothing else.
+            if (binding.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return binding;
+
+            if (binding.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                return binding;
+
+            return "http://" + binding;
+        }
+
         public bool AddSiteBinding(string applicationName, string siteBinding, SiteType siteType)
         {
-            IIS.Site site;
-
-            if (!siteBinding.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
-            {
-                siteBinding = "http://" + siteBinding;
-            }
-
-            var uri = new Uri(siteBinding);
-
+            var uri = new Uri(NormalizeBinding(siteBinding));
             try
             {
-                using (var iis = GetServerManager())
+                using (ServerManager iis = GetServerManager())
                 {
                     if (!IsAvailable(uri.Host, uri.Port, iis))
                     {
                         return false;
                     }
 
-                    if (siteType == SiteType.Live)
-                    {
-                        site = iis.Sites[GetLiveSite(applicationName)];
-                    }
-                    else
-                    {
-                        site = iis.Sites[GetServiceSite(applicationName)];
-                    }
+                    IIS.Site site = siteType == SiteType.Live
+                        ? iis.Sites[GetLiveSite(applicationName)] 
+                        : iis.Sites[GetServiceSite(applicationName)];
 
-                    if (site != null)
-                    {
-                        site.Bindings.Add("*:" + uri.Port + ":" + uri.Host, "http");
-                        iis.CommitChanges();
+                    if (site == null)
+                        return true;
 
-                        Thread.Sleep(1000);
-                    }
+                    site.Bindings.Add("*:" + uri.Port + ":" + uri.Host, uri.Scheme);
+                    iis.CommitChanges();
+
+                    Thread.Sleep(1000);
                 }
                 return true;
             }
@@ -277,38 +282,30 @@ namespace Kudu.SiteManagement
 
         public bool RemoveSiteBinding(string applicationName, string siteBinding, SiteType siteType)
         {
-            IIS.Site site;
-
             try
             {
                 using (var iis = GetServerManager())
                 {
-                    if (siteType == SiteType.Live)
-                    {
-                        site = iis.Sites[GetLiveSite(applicationName)];
-                    }
-                    else
-                    {
-                        site = iis.Sites[GetServiceSite(applicationName)];
-                    }
+                    IIS.Site site = siteType == SiteType.Live 
+                        ? iis.Sites[GetLiveSite(applicationName)] 
+                        : iis.Sites[GetServiceSite(applicationName)];
 
-                    if (site != null)
-                    {
-                        var uri = new Uri(siteBinding);
-                        var binding = site.Bindings.FirstOrDefault(x => x.Host.Equals(uri.Host)
-                                && x.EndPoint.Port.Equals(uri.Port)
-                                && x.Protocol.Equals(uri.Scheme));
+                    if (site == null) 
+                        return true;
+                    
+                    var uri = new Uri(siteBinding);
+                    var binding = site.Bindings
+                        .FirstOrDefault(x => x.Host.Equals(uri.Host)
+                            && x.EndPoint.Port.Equals(uri.Port)
+                            && x.Protocol.Equals(uri.Scheme));
 
-                        if (binding != null)
-                        {
-                            site.Bindings.Remove(binding);
-                            iis.CommitChanges();
-
-                            Thread.Sleep(1000);
-                        }
-                    }
+                    if (binding == null) 
+                        return true;
+                        
+                    site.Bindings.Remove(binding);
+                    iis.CommitChanges();
+                    Thread.Sleep(1000);
                 }
-
                 return true;
             }
             catch
@@ -317,7 +314,7 @@ namespace Kudu.SiteManagement
             }
         }
 
-        private static void MapServiceSitePath(IIS.ServerManager iis, string applicationName, string path, string siteRoot)
+        private static void MapServiceSitePath(ServerManager iis, string applicationName, string path, string siteRoot)
         {
             string serviceSiteName = GetServiceSite(applicationName);
 
@@ -332,7 +329,7 @@ namespace Kudu.SiteManagement
             site.Applications.Add(path, siteRoot);
         }
 
-        private static IIS.ApplicationPool EnsureAppPool(IIS.ServerManager iis, string appName)
+        private static ApplicationPool EnsureAppPool(ServerManager iis, string appName)
         {
             string appPoolName = GetAppPool(appName);
             var kuduAppPool = iis.ApplicationPools[appPoolName];
@@ -341,7 +338,7 @@ namespace Kudu.SiteManagement
                 iis.ApplicationPools.Add(appPoolName);
                 iis.CommitChanges();
                 kuduAppPool = iis.ApplicationPools[appPoolName];
-                kuduAppPool.ManagedPipelineMode = IIS.ManagedPipelineMode.Integrated;
+                kuduAppPool.ManagedPipelineMode = ManagedPipelineMode.Integrated;
                 kuduAppPool.ManagedRuntimeVersion = "v4.0";
                 kuduAppPool.AutoStart = true;
                 kuduAppPool.ProcessModel.LoadUserProfile = true;
@@ -352,18 +349,8 @@ namespace Kudu.SiteManagement
             return kuduAppPool;
         }
 
-        private static List<String> GetDefaultBindings(string applicationName, string baseUrl)
-        {
-            var siteBindings = new List<string>();
-            if (!String.IsNullOrWhiteSpace(baseUrl))
-            {
-                string binding = CreateBindingInformation(applicationName, baseUrl);
-                siteBindings.Add(binding);
-            }
-            return siteBindings;
-        }
 
-        private static int GetRandomPort(IIS.ServerManager iis)
+        private static int GetRandomPort(ServerManager iis)
         {
             int randomPort = portNumberGenRnd.Next(1025, 65535);
             while (!IsAvailable(randomPort, iis))
@@ -374,48 +361,23 @@ namespace Kudu.SiteManagement
             return randomPort;
         }
 
-        private static bool IsAvailable(int port, IIS.ServerManager iis)
+        private static bool IsAvailable(int port, ServerManager iis)
         {
             var tcpConnections = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpConnections();
-            foreach (var connectionInfo in tcpConnections)
-            {
-                if (connectionInfo.LocalEndPoint.Port == port)
-                {
-                    return false;
-                }
-            }
-
-            foreach (var iisSite in iis.Sites)
-            {
-                foreach (var binding in iisSite.Bindings)
-                {
-                    if (binding.EndPoint != null && binding.EndPoint.Port == port)
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
+            return tcpConnections.All(connectionInfo => connectionInfo.LocalEndPoint.Port != port)
+                && iis.Sites
+                    .SelectMany(iisSite => iisSite.Bindings)
+                    .All(binding => binding.EndPoint == null || binding.EndPoint.Port != port);
         }
 
-        private static bool IsAvailable(string host, int port, IIS.ServerManager iis)
+        private static bool IsAvailable(string host, int port, ServerManager iis)
         {
-            foreach (var iisSite in iis.Sites)
-            {
-                foreach (var binding in iisSite.Bindings)
-                {
-                    if (binding.EndPoint != null && binding.EndPoint.Port == port && binding.Host == host)
-                    {
-                        return false;
-                    }
-                }
-            }
-
-            return true;
+            return iis.Sites
+                .SelectMany(iisSite => iisSite.Bindings)
+                .All(binding => binding.EndPoint == null || binding.EndPoint.Port != port || binding.Host != host);
         }
 
-        private IIS.Site CreateSiteAsync(IIS.ServerManager iis, string applicationName, string siteName, string siteRoot, List<string> siteBindings)
+        private IIS.Site CreateSiteAsync(ServerManager iis, string applicationName, string siteName, string siteRoot, List<string> siteBindings)
         {
             var pool = EnsureAppPool(iis, applicationName);
 
@@ -444,22 +406,21 @@ namespace Kudu.SiteManagement
             return site;
         }
 
-        private static void EnsureDefaultDocument(IIS.ServerManager iis)
+        private static void EnsureDefaultDocument(ServerManager iis)
         {
-            Configuration applicationHostConfiguration = iis.GetApplicationHostConfiguration();
+            IIS.Configuration applicationHostConfiguration = iis.GetApplicationHostConfiguration();
             ConfigurationSection defaultDocumentSection = applicationHostConfiguration.GetSection("system.webServer/defaultDocument");
 
             ConfigurationElementCollection filesCollection = defaultDocumentSection.GetCollection("files");
 
-            if (!filesCollection.Any(ConfigurationElementContainsHostingStart))
-            {
-                ConfigurationElement addElement = filesCollection.CreateElement("add");
+            if (filesCollection.Any(ConfigurationElementContainsHostingStart))
+                return;
 
-                addElement["value"] = HostingStartHtml;
-                filesCollection.Add(addElement);
+            ConfigurationElement addElement = filesCollection.CreateElement("add");
+            addElement["value"] = HostingStartHtml;
+            filesCollection.Add(addElement);
 
-                iis.CommitChanges();
-            }
+            iis.CommitChanges();
         }
 
         private static bool ConfigurationElementContainsHostingStart(ConfigurationElement configurationElement)
@@ -501,7 +462,7 @@ namespace Kudu.SiteManagement
             return String.Format("{0}:{1}:{2}", ip, port, applicationName + "." + host);
         }
 
-        private static Task DeleteSiteAsync(IIS.ServerManager iis, string siteName, bool deletePhysicalFiles = true)
+        private static Task DeleteSiteAsync(ServerManager iis, string siteName, bool deletePhysicalFiles = true)
         {
             var site = iis.Sites[siteName];
             if (site != null)
@@ -550,7 +511,7 @@ namespace Kudu.SiteManagement
 
         private static ServerManager GetServerManager()
         {
-            return new IIS.ServerManager(Environment.ExpandEnvironmentVariables("%windir%\\system32\\inetsrv\\config\\applicationHost.config"));
+            return new ServerManager(Environment.ExpandEnvironmentVariables("%windir%\\system32\\inetsrv\\config\\applicationHost.config"));
         }
 
         private static async Task WaitForSiteAsync(string serviceUrl)

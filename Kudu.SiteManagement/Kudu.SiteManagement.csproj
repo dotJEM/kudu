@@ -24,6 +24,7 @@
       <HintPath>..\packages\Microsoft.Web.Administration.7.0.0.0\lib\net20\Microsoft.Web.Administration.dll</HintPath>
     </Reference>
     <Reference Include="System" />
+    <Reference Include="System.Configuration" />
     <Reference Include="System.Core" />
     <Reference Include="System.IO.Abstractions, Version=1.4.0.74, Culture=neutral, PublicKeyToken=d480b5b72fb413da, processorArchitecture=MSIL">
       <SpecificVersion>False</SpecificVersion>
@@ -57,11 +58,16 @@
     <Compile Include="..\Common\CommonAssemblyInfo.cs">
       <Link>Properties\CommonAssemblyInfo.cs</Link>
     </Compile>
+    <Compile Include="Configuration\KuduConfiguration.cs" />
+    <Compile Include="Configuration\Section\KuduConfigurationSection.cs" />
+    <Compile Include="Configuration\Section\PathConfigurationElement.cs" />
+    <Compile Include="Configuration\Section\UriScheme.cs" />
+    <Compile Include="Configuration\Section\UriSchemeConverter.cs" />
+    <Compile Include="Configuration\Section\UrlConfigurationElement.cs" />
+    <Compile Include="Configuration\UrlConfiguration.cs" />
     <Compile Include="DefaultPathResolver.cs">
       <SubType>Code</SubType>
     </Compile>
-    <Compile Include="DefaultSettingsResolver.cs" />
-    <Compile Include="ISettingsResolver.cs" />
     <Compile Include="IPathResolver.cs" />
     <Compile Include="ISiteManager.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
